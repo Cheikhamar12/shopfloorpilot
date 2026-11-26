@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ import pytest
 from shopfloorpilot.datagen import Dataset, generate
 from shopfloorpilot.datagen import config as cfg
 from shopfloorpilot.datagen.cli import main
-from shopfloorpilot.datagen.generator import write_csv
+from shopfloorpilot.datagen.generator import period_end, write_csv
 
 
 @pytest.fixture(scope="module")
@@ -80,3 +81,52 @@ def test_open_purchase_orders_exist(ds: Dataset) -> None:
 def test_cli_writes_csv(tmp_path: Path) -> None:
     assert main(["--out", str(tmp_path), "--seed", "1"]) == 0
     assert (tmp_path / "downtimes.csv").stat().st_size > 0
+
+
+def test_period_end() -> None:
+    """Fin de période correcte, y compris pour un mois de 28 jours et en fin d'année."""
+    assert period_end(date(2026, 1, 1), 1) == date(2026, 1, 31)
+    assert period_end(date(2026, 1, 1), 2) == date(2026, 2, 28)
+    assert period_end(date(2026, 1, 1), 6) == date(2026, 6, 30)
+    assert period_end(date(2026, 1, 1), 12) == date(2026, 12, 31)
+
+
+def test_months_limits_the_period() -> None:
+    """Avec months=1, toutes les données tombent en janvier."""
+    ds = generate(seed=42, months=1)
+    assert all(o.prod_date.month == 1 for o in ds.production_orders)
+    assert all(p.order_date.month == 1 for p in ds.purchase_orders)
+    assert 0 < len(ds.production_orders) < len(generate(seed=42).production_orders)
+
+
+@pytest.mark.parametrize("months", [0, 13, -1])
+def test_months_out_of_range(months: int) -> None:
+    """Une valeur hors de 1..12 est refusée avec un message explicite."""
+    with pytest.raises(ValueError, match="entre 1 et 12"):
+        generate(seed=42, months=months)
+
+
+def test_cli_rejects_bad_months(tmp_path: Path) -> None:
+    """La CLI transforme l'erreur en message d'usage (code de sortie 2)."""
+    with pytest.raises(SystemExit) as exc:
+        main(["--out", str(tmp_path), "--months", "13"])
+    assert exc.value.code == 2
+
+
+def test_months_are_stable_prefixes() -> None:
+    """Les données de janvier sont les mêmes qu'on génère 1 ou 2 mois (base de l'incrémental).
+
+    Seules les commandes encore en cours au 31 janvier peuvent changer : elles ont été
+    livrées entre-temps (changement d'état), tout le reste est identique.
+    """
+    jan, jan_feb = generate(seed=42, months=1), generate(seed=42, months=2)
+    feb_orders = {o.of_id: o for o in jan_feb.production_orders}
+    assert all(feb_orders[o.of_id] == o for o in jan.production_orders)
+
+    feb_pos = {p.po_id: p for p in jan_feb.purchase_orders}
+    for po in jan.purchase_orders:
+        later = feb_pos[po.po_id]
+        if po.status == "livree":
+            assert later == po
+        else:  # en cours au 31 janvier : mêmes attributs, seule la livraison peut avoir évolué
+            assert (later.supplier_id, later.promised_date) == (po.supplier_id, po.promised_date)
