@@ -13,9 +13,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Génère les données fictives ShopFloorPilot.")
     parser.add_argument("--out", type=Path, default=Path("data"), help="dossier de sortie")
     parser.add_argument("--seed", type=int, default=42, help="graine aléatoire")
+    parser.add_argument(
+        "--months", type=int, default=6, help="durée de la période en mois, de 1 à 12"
+    )
     args = parser.parse_args(argv)
 
-    counts = write_csv(generate(args.seed), args.out)
+    try:
+        dataset = generate(args.seed, args.months)
+    except ValueError as exc:
+        parser.error(str(exc))  # message clair + code de sortie 2, au lieu d'une trace Python
+    counts = write_csv(dataset, args.out)
     for table, n in counts.items():
         print(f"{table:<20} {n:>8} lignes")
     return 0

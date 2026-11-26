@@ -1,19 +1,16 @@
-"""Génère un jeu de données industrielles déterministe pour ShopFloorPilot.
+"""Construit le jeu de données complet, en mémoire.
 
-Tables produites : usines, machines, fournisseurs, ordres de fabrication (OF),
-arrêts machine, vérité terrain des arrêts « Autre », commandes fournisseurs.
+Déterministe : chaque famille de tables a son propre générateur aléatoire, dérivé
+de la graine, et les tirages se font dans un ordre fixe. Ne jamais utiliser le module
+`random` global ni l'heure courante ici, sinon la reproductibilité est perdue.
 
-Rappel TRS (taux de rendement synthétique) :
-    TRS = disponibilité x performance x qualité
-        = (temps de marche / temps planifié)
-          x (pièces totales x cycle théorique / temps de marche)
-          x (pièces bonnes / pièces totales)
-        = (pièces bonnes x cycle théorique) / temps planifié
+Pourquoi deux générateurs (production / achats) ? Si les achats tiraient dans la même
+suite que la production, allonger la période (plus de jours de production) décalerait
+tous les tirages des achats : les commandes de janvier changeraient selon `months`.
+Avec des suites séparées, les données d'un mois donné sont stables quelle que soit la
+durée générée, ce qui permet de simuler une arrivée incrémentale des données.
 
-Invariants garantis (vérifiés par tests/test_datagen.py) :
-- temps de marche = temps planifié - somme des arrêts de l'OF ;
-- pièces bonnes <= pièces totales <= capacité théorique ;
-- même graine => mêmes fichiers, octet pour octet.
+`months` : durée de la période, à partir du 1er janvier 2026 (1 à 12 mois).
 """
 
 from __future__ import annotations
@@ -137,6 +134,18 @@ def _working_days(start: date, end: date) -> list[date]:
     return days
 
 
+def period_end(start: date, months: int) -> date:
+    """Dernier jour de la période de `months` mois qui commence à `start` (début de mois).
+
+    Exemple : period_end(1er janvier 2026, 6) -> 30 juin 2026.
+    Astuce : on calcule le 1er jour du mois SUIVANT la période, puis on recule d'un jour,
+    ce qui évite de gérer à la main les mois de 28, 30 ou 31 jours.
+    """
+    month_index = start.month - 1 + months  # mois suivant la période, compté depuis janvier = 0
+    first_after = date(start.year + month_index // 12, month_index % 12 + 1, 1)
+    return first_after - timedelta(days=1)
+
+
 def _build_machines() -> list[Machine]:
     """Crée le parc machine : même composition dans chaque usine (7 machines par site)."""
     machines = []
@@ -181,7 +190,7 @@ def _pick_category(rng: random.Random, plant_id: str, machine_id: str, day: date
 
 
 def _generate_production(
-    rng: random.Random, machines: list[Machine]
+    rng: random.Random, machines: list[Machine], start: date, end: date
 ) -> tuple[list[ProductionOrder], list[Downtime], list[DowntimeLabel]]:
     """Génère les OF, leurs arrêts et la vérité terrain des arrêts « Autre ».
 
@@ -198,7 +207,7 @@ def _generate_production(
     labels: list[DowntimeLabel] = []
     of_seq = ev_seq = 0  # compteurs => identifiants stables d'une exécution à l'autre
 
-    for day in _working_days(cfg.START_DATE, cfg.END_DATE):
+    for day in _working_days(start, end):
         for machine in machines:
             of_seq += 1
             of_id = f"OF-{of_seq:07d}"
@@ -284,7 +293,7 @@ def _generate_production(
 # ---------------------------------------------------------------------------
 
 
-def _generate_purchase_orders(rng: random.Random) -> list[PurchaseOrder]:
+def _generate_purchase_orders(rng: random.Random, start: date, end: date) -> list[PurchaseOrder]:
     """Génère les commandes fournisseurs, avec retards et commandes encore ouvertes.
 
     - Chaque fournisseur livre à l'heure avec la probabilité `reliability`.
@@ -295,7 +304,7 @@ def _generate_purchase_orders(rng: random.Random) -> list[PurchaseOrder]:
     """
     pos: list[PurchaseOrder] = []
     seq = 0
-    for day in _working_days(cfg.START_DATE, cfg.END_DATE):
+    for day in _working_days(start, end):
         if day.weekday() not in (0, 3):  # commandes passées le lundi et le jeudi
             continue
         for plant in cfg.PLANTS:
@@ -318,7 +327,7 @@ def _generate_purchase_orders(rng: random.Random) -> list[PurchaseOrder]:
                     delay = -rng.randint(1, 3)  # livraison en avance
                 delivered: date | None = promised + timedelta(days=delay)
                 status = "livree"
-                if delivered is not None and delivered > cfg.END_DATE:
+                if delivered is not None and delivered > end:
                     delivered, status = None, "en_cours"  # pas encore livrée à la date d'extraction
                 pos.append(
                     PurchaseOrder(
@@ -341,16 +350,24 @@ def _generate_purchase_orders(rng: random.Random) -> list[PurchaseOrder]:
 # ---------------------------------------------------------------------------
 
 
-def generate(seed: int = 42) -> Dataset:
+def generate(seed: int = 42, months: int = 6) -> Dataset:
     """Construit le jeu de données complet, en mémoire.
 
     Déterministe : un seul `random.Random(seed)` est partagé et les tables sont
     générées dans un ordre fixe. Ne jamais utiliser le module `random` global
     ni l'heure courante ici, sinon la reproductibilité est perdue.
+
+    `months` : durée de la période, à partir du 1er janvier 2026 (1 à 12 mois).
+    Avec la valeur par défaut (6), les données sont identiques à la version précédente.
     """
-    rng = random.Random(seed)
+    if not 1 <= months <= 12:
+        raise ValueError(f"months doit être compris entre 1 et 12, reçu : {months}")
+    start = cfg.START_DATE
+    end = period_end(start, months)
+    rng_production = random.Random(seed)
+    rng_purchases = random.Random(f"{seed}:purchase_orders")  # suite indépendante
     machines = _build_machines()
-    orders, downtimes, labels = _generate_production(rng, machines)
+    orders, downtimes, labels = _generate_production(rng_production, machines, start, end)
     return Dataset(
         plants=list(cfg.PLANTS),
         machines=machines,
@@ -358,7 +375,7 @@ def generate(seed: int = 42) -> Dataset:
         production_orders=orders,
         downtimes=downtimes,
         downtime_labels=labels,
-        purchase_orders=_generate_purchase_orders(rng),
+        purchase_orders=_generate_purchase_orders(rng_purchases, start, end),
     )
 
 
